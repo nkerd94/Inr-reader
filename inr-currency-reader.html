@@ -1,0 +1,251 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Note Reader – Indian Rupee</title>
+<style>
+  :root{--bg:#000;--fg:#fff;--accent:#ffd400;--muted:#bdbdbd}
+  *{box-sizing:border-box}
+  html,body{height:100%;margin:0;background:var(--bg);color:var(--fg);
+    font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+  body{display:flex;flex-direction:column;padding:env(safe-area-inset-top) 12px env(safe-area-inset-bottom);gap:12px}
+  h1{font-size:1.1rem;margin:10px 0 0;font-weight:600;color:var(--muted)}
+  #stage{position:relative;flex:0 0 28vh;border:3px solid var(--muted);border-radius:12px;overflow:hidden;background:#111}
+  video{width:100%;height:100%;object-fit:cover}
+  #frame{position:absolute;inset:18% 12%;border:3px dashed var(--accent);border-radius:8px;pointer-events:none}
+  #result{flex:1;display:flex;align-items:center;justify-content:center;text-align:center;
+    font-size:clamp(2.4rem,12vw,5rem);font-weight:800;line-height:1.1;color:var(--accent);padding:8px}
+  #result.small{font-size:clamp(1.4rem,6vw,2.2rem);color:var(--fg);font-weight:600}
+  .row{display:flex;gap:10px}
+  button{font:inherit;font-weight:700;border:3px solid var(--fg);background:#000;color:var(--fg);
+    border-radius:14px;padding:18px 10px;font-size:1.3rem;min-height:64px;flex:1}
+  button.primary{background:var(--accent);color:#000;border-color:var(--accent);font-size:2rem;min-height:110px}
+  button[aria-pressed="true"]{background:var(--fg);color:#000}
+  button:focus-visible,summary:focus-visible{outline:5px solid #4da3ff;outline-offset:3px}
+  details{border:2px solid #444;border-radius:10px;padding:10px;margin-bottom:12px}
+  summary{font-size:1.1rem;padding:6px;color:var(--muted)}
+  details p{color:var(--muted);font-size:.95rem;margin:8px 0}
+  .cal{display:grid;grid-template-columns:repeat(4,1fr);gap:8px}
+  .cal button{min-height:52px;font-size:1.1rem;padding:8px}
+  canvas{display:none}
+  @media (prefers-reduced-motion:no-preference){#result{transition:color .2s}}
+</style>
+</head>
+<body>
+<h1>Note Reader · Indian Rupee</h1>
+
+<div id="stage" aria-hidden="true">
+  <video id="video" playsinline muted></video>
+  <div id="frame"></div>
+</div>
+
+<div id="result" role="status" aria-live="assertive" class="small">Tap anywhere to start the camera</div>
+
+<div class="row">
+  <button class="primary" id="scan" aria-label="Scan note">Scan note</button>
+</div>
+<div class="row">
+  <button id="repeat" aria-label="Repeat last result">Repeat</button>
+  <button id="auto" aria-pressed="false" aria-label="Auto scan, off">Auto: off</button>
+</div>
+
+<details>
+  <summary>Setup for a sighted helper (improves accuracy)</summary>
+  <p>Lighting and note wear change colours. Hold a real note inside the dashed box in normal light, then tap its value. The app remembers it on this device.</p>
+  <div class="cal" id="cal"></div>
+  <button id="reset" style="margin-top:10px;min-height:48px;font-size:1rem">Reset to defaults</button>
+</details>
+
+<canvas id="canvas" width="96" height="96"></canvas>
+
+<script>
+(() => {
+  "use strict";
+  const $ = id => document.getElementById(id);
+  const video = $("video"), canvas = $("canvas"), ctx = canvas.getContext("2d", {willReadFrequently:true});
+  const result = $("result");
+
+  // Typical colours of the Mahatma Gandhi (New) series, as hue°, saturation, value.
+  const DEFAULTS = {
+    10:  {h: 25,  s: .55, v: .45},   // chocolate brown
+    20:  {h: 70,  s: .60, v: .70},   // greenish yellow
+    50:  {h: 185, s: .50, v: .70},   // fluorescent blue
+    100: {h: 270, s: .25, v: .65},   // lavender
+    200: {h: 40,  s: .60, v: .85},   // bright yellow
+    500: {h: 90,  s: .12, v: .60},   // stone grey
+    2000:{h: 310, s: .40, v: .70}    // magenta
+  };
+  const KEY = "inr-reader-calibration-v1";
+  let refs = load();
+  function load(){
+    try { const s = JSON.parse(localStorage.getItem(KEY)); if (s) return {...DEFAULTS, ...s}; } catch(e){}
+    return {...DEFAULTS};
+  }
+  function save(){ try { localStorage.setItem(KEY, JSON.stringify(refs)); } catch(e){} }
+
+  // ---------- speech ----------
+  let lastSpoken = "";
+  function speak(text, {remember=true, show=true}={}){
+    if (remember) lastSpoken = text;
+    if (show) result.textContent = text;
+    if (!("speechSynthesis" in window)) return;
+    speechSynthesis.cancel();
+    const u = new SpeechSynthesisUtterance(text);
+    const v = speechSynthesis.getVoices().find(v => /en[-_]IN/i.test(v.lang)) ||
+              speechSynthesis.getVoices().find(v => /^en/i.test(v.lang));
+    if (v) { u.voice = v; u.lang = v.lang; } else u.lang = "en-IN";
+    u.rate = 0.9;
+    speechSynthesis.speak(u);
+  }
+  function buzz(p){ if (navigator.vibrate) navigator.vibrate(p); }
+  const words = {10:"Ten rupees",20:"Twenty rupees",50:"Fifty rupees",100:"One hundred rupees",
+                 200:"Two hundred rupees",500:"Five hundred rupees",2000:"Two thousand rupees"};
+
+  // ---------- colour maths ----------
+  function rgb2hsv(r,g,b){
+    r/=255; g/=255; b/=255;
+    const mx = Math.max(r,g,b), mn = Math.min(r,g,b), d = mx-mn;
+    let h = 0;
+    if (d){
+      if (mx===r) h = ((g-b)/d)%6; else if (mx===g) h = (b-r)/d+2; else h = (r-g)/d+4;
+      h *= 60; if (h<0) h+=360;
+    }
+    return {h, s: mx? d/mx : 0, v: mx};
+  }
+  // Hue only matters when there is enough saturation, so weight it by saturation.
+  function vec({h,s,v}){ const a = h*Math.PI/180; return [s*Math.cos(a), s*Math.sin(a), v*0.5]; }
+  function dist(a,b){ return Math.hypot(a[0]-b[0], a[1]-b[1], a[2]-b[2]); }
+
+  function sampleFrame(){
+    const vw = video.videoWidth, vh = video.videoHeight;
+    if (!vw) return null;
+    // centre 76% x 64% region, matching the dashed box
+    const sx = vw*0.12, sy = vh*0.18, sw = vw*0.76, sh = vh*0.64;
+    ctx.drawImage(video, sx, sy, sw, sh, 0, 0, canvas.width, canvas.height);
+    const d = ctx.getImageData(0,0,canvas.width,canvas.height).data;
+    let r=0,g=0,b=0,n=0;
+    for (let i=0;i<d.length;i+=4){ r+=d[i]; g+=d[i+1]; b+=d[i+2]; n++; }
+    r/=n; g/=n; b/=n;
+    // normalise brightness a little so dim rooms don't shift hue/value too much
+    const m = Math.max(r,g,b,1), k = Math.min(1.6, 210/m);
+    return rgb2hsv(Math.min(255,r*k), Math.min(255,g*k), Math.min(255,b*k));
+  }
+
+  function classify(hsv){
+    const x = vec(hsv);
+    const ranked = Object.entries(refs)
+      .map(([den,ref]) => ({den:+den, d: dist(x, vec(ref))}))
+      .sort((a,b) => a.d-b.d);
+    return {best: ranked[0], second: ranked[1]};
+  }
+
+  // ---------- scanning ----------
+  let scanning = false;
+  async function scan(){
+    if (scanning) return;
+    if (!video.srcObject) return startCamera();
+    scanning = true;
+    buzz(30);
+    result.className = "small"; result.textContent = "Reading…";
+    const votes = {}; let frames = 0, avg = null;
+    for (let i=0;i<12;i++){
+      const hsv = sampleFrame();
+      if (hsv){
+        frames++;
+        const {best, second} = classify(hsv);
+        if (best.d < 0.35 && best.d/(second.d||1) < 0.8) votes[best.den] = (votes[best.den]||0)+1;
+        avg = hsv;
+      }
+      await new Promise(r => setTimeout(r, 90));
+    }
+    scanning = false;
+    const top = Object.entries(votes).sort((a,b)=>b[1]-a[1])[0];
+    if (frames && top && top[1]/frames >= 0.6){
+      result.className = "";
+      speak(words[top[0]]);
+      buzz([60,40,60]);
+    } else {
+      result.className = "small";
+      speak("Not sure. Hold the note flat, fill the box, with good light. Try again.");
+      buzz([200]);
+    }
+    return avg;
+  }
+
+  // ---------- camera ----------
+  async function startCamera(){
+    if (video.srcObject) return;
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video:{facingMode:{ideal:"environment"}, width:{ideal:1280}, height:{ideal:720}}, audio:false});
+      video.srcObject = stream; await video.play();
+      speak("Camera ready. Hold the note flat in front of the camera, then tap anywhere to scan.", {remember:false});
+      result.className = "small";
+    } catch (e){
+      result.className = "small";
+      speak("Camera not available. Please allow camera access and reload the page.");
+    }
+  }
+
+  // ---------- auto mode ----------
+  let autoTimer = null, lastAuto = "";
+  $("auto").addEventListener("click", e => {
+    e.stopPropagation();
+    const on = $("auto").getAttribute("aria-pressed") !== "true";
+    $("auto").setAttribute("aria-pressed", on);
+    $("auto").textContent = "Auto: " + (on ? "on" : "off");
+    $("auto").setAttribute("aria-label", "Auto scan, " + (on ? "on" : "off"));
+    clearInterval(autoTimer);
+    if (on){
+      if (!video.srcObject) startCamera();
+      speak("Auto scan on", {remember:false, show:false});
+      autoTimer = setInterval(async () => {
+        if (scanning || speechSynthesis.speaking || !video.srcObject) return;
+        await scan();
+      }, 4000);
+    } else speak("Auto scan off", {remember:false, show:false});
+  });
+
+  // ---------- controls ----------
+  $("scan").addEventListener("click", e => { e.stopPropagation(); scan(); });
+  $("repeat").addEventListener("click", e => {
+    e.stopPropagation();
+    speak(lastSpoken || "Nothing scanned yet", {remember:false});
+  });
+  // tap anywhere else scans, so no precise aiming is needed
+  document.body.addEventListener("click", e => {
+    if (e.target.closest("button, details")) return;
+    scan();
+  });
+  document.addEventListener("keydown", e => {
+    if (e.target.closest("button, summary")) return;
+    if (e.key === " " || e.key === "Enter"){ e.preventDefault(); scan(); }
+    if (e.key.toLowerCase() === "r") speak(lastSpoken || "Nothing scanned yet", {remember:false});
+  });
+
+  // ---------- calibration (for a sighted helper) ----------
+  const cal = $("cal");
+  Object.keys(DEFAULTS).forEach(den => {
+    const b = document.createElement("button");
+    b.textContent = "₹" + den;
+    b.setAttribute("aria-label", "Save this note as " + words[den]);
+    b.addEventListener("click", () => {
+      const hsv = sampleFrame();
+      if (!hsv){ speak("Start the camera first"); return; }
+      refs[den] = hsv; save();
+      speak("Saved as " + words[den], {remember:false});
+    });
+    cal.appendChild(b);
+  });
+  $("reset").addEventListener("click", () => {
+    refs = {...DEFAULTS}; try { localStorage.removeItem(KEY); } catch(e){}
+    speak("Reset to default colours", {remember:false});
+  });
+
+  if ("speechSynthesis" in window) speechSynthesis.getVoices();
+  window.addEventListener("pagehide", () => { const s = video.srcObject; if (s) s.getTracks().forEach(t => t.stop()); });
+})();
+</script>
+</body>
+</html>
